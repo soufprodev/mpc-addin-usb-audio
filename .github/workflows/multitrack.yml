@@ -64,3 +64,25 @@ jobs:
         with:
           name: multitrack-build
           path: out/
+
+      # The share-ready kit: README.txt, LICENSES.txt and the "multitrack" folder that goes on the
+      # MPC's SD card or USB stick (installer, addin zip, plugin folder).
+      - name: Kit
+        run: |
+          K=kit/MPC-Multitrack-Kit
+          M="$K/multitrack"
+          mkdir -p "$M" /tmp/plugin
+          cp mpc-addin-usb-audio/kit/README.txt mpc-addin-usb-audio/kit/LICENSES.txt "$K/"
+          cp mpc-addin-usb-audio/kit/multitrack/install.sh mpc-addin-usb-audio/kit/multitrack/uninstall.sh "$M/"
+          cp mpc-addin-usb-audio/dist/MPC-USB-audio-addin-*-mpc-armv7.zip "$M/"
+          unzip -q out/usb-out-*-mpc.zip -d /tmp/plugin
+          cp -r "/tmp/plugin/MPC USB Audio - VST - USB Out" "$M/"
+          test -f "$M/MPC USB Audio - VST - USB Out/plugin.json"
+          test -f "$M/install.sh"
+          ls -1 "$M"/MPC-USB-audio-addin-*-mpc-armv7.zip
+          find kit -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MPC-Multitrack-Kit
+          path: kit/
