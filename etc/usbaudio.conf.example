@@ -31,13 +31,14 @@ sample_bytes=4
 
 # Channels the computer records, in order. out1..outN are MPC's playback channels on the codec
 # (out1,out2 = main out), in1..inN are MPC's inputs as MPC reads them (before computer audio is
-# mixed in), "0" or "-" is silence. Up to 16. Keep it at 5 channels or fewer with hs_bint=4 (FIFO
-# limit, see docs/FEASIBILITY.md); for more, set hs_bint=1.
+# mixed in), send1..send25 are the USB Out plugin's channels (USB Out's "USB Ch 3" is send1, as long
+# as to_host starts with out1,out2), "0" or "-" is silence. Ranges work: out1-27. Up to 27 (the kernel's UAC2 limit per
+# direction). hs_bint is lowered automatically when a USB packet would pass 1024 bytes (the log says so).
 to_host=out1,out2,in1,in2
 
-# Channels the computer plays to the MPC (0 = no playback device on the computer).
+# Channels the computer plays to the MPC (0 = no playback device on the computer). Up to 27.
 host_channels=2
-# Where they land: one entry per MPC input channel, host1..hostN or 0 (nothing).
+# Where they land: one entry per MPC input channel, host1..hostN or 0 (nothing). Ranges work: host1-27.
 to_mpc_in=host1,host2
 # sum: add computer audio to the MPC inputs; replace: computer audio instead of the inputs;
 # off: computer audio is received but dropped.
@@ -51,6 +52,17 @@ iad_class=1
 function_name=MPC USB Audio
 
 # --- MPC side --------------------------------------------------------------------------------
+# Wide codec (multitrack). MPC sizes its outputs and inputs from the codec's PCM. wide_out=N tells MPC
+# the codec's playback PCM has N channels (wide_in: capture); MPC's channels 1-2 still go to the codec,
+# and out3..outN / in3..inN exist only on USB. Whether MPC then offers outputs 3..N for track routing
+# is up to MPC: the log shows what MPC asked for ("MPC asked for ... channels"). 0 = off. Up to 32.
+# Multitrack example (27 = the most USB carries per direction):
+#   wide_out=32
+#   to_host=out1-27
+#   sample_bytes=3
+wide_out=0
+wide_in=0
+
 # ALSA card of the codec: auto follows /dev/snd/by-path/platform-sound. Where there is none (a model
 # whose audio is a USB device), auto uses the first card MPC opens; the log names it.
 tap_card=auto
