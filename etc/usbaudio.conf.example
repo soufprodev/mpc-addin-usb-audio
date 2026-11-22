@@ -27,14 +27,14 @@ hub_mux_check=1
 # Must equal the rate MPC runs its codec at, or nothing is tapped (the log says so).
 rate=44100
 # Bytes per sample on USB: 2, 3 or 4.
-sample_bytes=4
+sample_bytes=3
 
 # Channels the computer records, in order. out1..outN are MPC's playback channels on the codec
 # (out1,out2 = main out), in1..inN are MPC's inputs as MPC reads them (before computer audio is
 # mixed in), send1..send25 are the USB Out plugin's channels (USB Out's "USB Ch 3" is send1, as long
 # as to_host starts with out1,out2), "0" or "-" is silence. Ranges work: out1-27. Up to 27 (the kernel's UAC2 limit per
 # direction). hs_bint is lowered automatically when a USB packet would pass 1024 bytes (the log says so).
-to_host=out1,out2,in1,in2
+to_host=out1,out2,send1-25
 
 # Channels the computer plays to the MPC (0 = no playback device on the computer). Up to 27.
 host_channels=2
