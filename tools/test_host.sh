@@ -9,10 +9,10 @@ B=build/host
 mkdir -p "$B"
 CF="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -g -O1 -fno-omit-frame-pointer"
 SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
-CORE="src/config.c src/chmap.c src/fmt.c src/drift.c src/gadget.c"
+CORE="src/config.c src/chmap.c src/fmt.c src/drift.c src/gadget.c src/send.c"
 export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1
 
-for t in ring fmt chmap drift config gadget; do
+for t in ring fmt chmap drift config gadget send; do
   $CC $CF $SAN -pthread "tests/test_$t.c" $CORE -lm -o "$B/t_$t"
   "$B/t_$t"
 done
@@ -50,6 +50,22 @@ run /bin/true
 echo "--- addin log"
 cat "$tmp/usbaudio.log"
 grep -q "no USB audio" "$tmp/usbaudio.log" && { echo "FAIL: gadget-missing warning although the gadget came"; exit 1; }
+# wide_out/wide_in: MPC is told the codec has more channels than it does; the codec gets its own, USB all of them.
+printf 'configfs=%s\ntap_card=0\nwide_out=8\nwide_in=4\nhost_channels=4\nto_mpc_in=host1-4\nto_host=out1-8,in1-4\nlog=%s\n' \
+  "$tmp/cfs" "$tmp/wide.log" > "$tmp/wide.conf"
+MPC_USB_AUDIO_CONF="$tmp/wide.conf" FAKE_CONFIGFS="$tmp/cfs" \
+  LD_PRELOAD="$ASANLIB:$PWD/$B/libmpc_usb_audio.so" "$B/bin/MPC" "$tmp/cfs" wide ||
+  { cat "$tmp/wide.log" 2>/dev/null; exit 1; }
+grep -q "MPC asked for 8 channels; the codec gets 2, channels 3-8 go to USB only" "$tmp/wide.log" &&
+  grep -q "playback: 8 ch as MPC sees it (codec 2" "$tmp/wide.log" && ! grep -q "problem" "$tmp/wide.log" ||
+  { echo "FAIL: wide log"; cat "$tmp/wide.log"; exit 1; }
+echo "ok   wide codec logged"
+# send bus: the USB Out plugin's channels ride along with the main out
+printf 'configfs=%s\ntap_card=0\nto_host=out1,out2,send1-4\nlog=%s\n' "$tmp/cfs" "$tmp/send.log" > "$tmp/send.conf"
+MPC_USB_AUDIO_CONF="$tmp/send.conf" FAKE_CONFIGFS="$tmp/cfs" \
+  LD_PRELOAD="$ASANLIB:$PWD/$B/libmpc_usb_audio.so" "$B/bin/MPC" "$tmp/cfs" send ||
+  { cat "$tmp/send.log" 2>/dev/null; exit 1; }
+grep -q "send bus: 4 channels" "$tmp/send.log" || { echo "FAIL: send log"; cat "$tmp/send.log"; exit 1; }
 # tap_card=auto without a platform codec (audio on a USB card), and MPC never enabling its gadget.
 printf 'configfs=%s\ntap_card=auto\nlog=%s\n' "$tmp/cfs" "$tmp/auto.log" > "$tmp/auto.conf"
 MPC_USB_AUDIO_CONF="$tmp/auto.conf" MPC_USB_AUDIO_GADGET_WAIT=1 FAKE_CONFIGFS="$tmp/cfs" \

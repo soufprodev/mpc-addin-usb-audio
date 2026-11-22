@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 IMAGE=${IMAGE:-arm32v7/gcc:11-bullseye}
 OUT=build/armhf
 mkdir -p "$OUT"
-SRCS="src/addin.c src/fwd.c src/alsa_api.c src/log.c src/config.c src/chmap.c src/fmt.c src/drift.c src/gadget.c"
+SRCS="src/addin.c src/fwd.c src/send.c src/alsa_api.c src/log.c src/config.c src/chmap.c src/fmt.c src/drift.c src/gadget.c"
 
 docker run --rm --platform linux/arm/v7 -u "$(id -u):$(id -g)" -v "$PWD:/w" -w /w "$IMAGE" sh -c "
   set -e
@@ -31,7 +31,7 @@ if [ "$(printf '%s\nGLIBC_2.31\n' "$max" | sort -V | tail -n1)" != GLIBC_2.31 ];
   echo "FAIL: needs $max; the oldest supported MPC OS has glibc 2.31" >&2; exit 1
 fi
 echo "exports:"; sed 's/^/  /' "$OUT/exports.txt"
-unexpected=$(grep -Ev '^(snd_pcm_(open|close|hw_params|writei|writen|readi|readn)|usbg_enable_gadget)$' "$OUT/exports.txt" || true)
+unexpected=$(grep -Ev '^(snd_pcm_(open|close|hw_params|writei|writen|readi|readn)|snd_pcm_hw_params_(any|current|get_channels|get_channels_max|test_channels|set_channels|set_channels_near|set_channels_min)|snd_pcm_(frames_to_bytes|bytes_to_frames)|mpcua_send_v1|usbg_enable_gadget)$' "$OUT/exports.txt" || true)
 if [ -n "$unexpected" ]; then echo "FAIL: unexpected exports: $unexpected" >&2; exit 1; fi
 ls -l "$OUT/libmpc_usb_audio.so"
 echo "armhf build OK"
