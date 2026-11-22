@@ -107,6 +107,14 @@ Read from `usbaudio.conf` in the addin's folder (or `$MPC_USB_AUDIO_CONF`) when 
 
 The log is `usbaudio.log` in the addin's folder (`log=` moves or disables it), with a stats line every 10 s.
 
+## Multitrack (USB Out plugin)
+
+On MPC OS 3.10.1 and later, the **USB Out** plugin (`plugin/UsbOut`, built with Akai's MPC Plugin
+SDK) goes on any track, pad or bus and sends it to its own USB channel. Up to 27 channels: the main
+mix on 1-2, and USB Out channels on 3-27 (`to_host=out1,out2,send1-25`,
+etc/usbaudio-multitrack.conf). The Multitrack build workflow builds both pieces. See
+docs/MULTITRACK.md. (An experimental alternative, `wide_out`, offers MPC more codec outputs instead.)
+
 ## Limits
 
 - The USB rate is fixed when MPC starts and must equal MPC's codec rate (44.1 kHz by default).
