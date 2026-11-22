@@ -66,5 +66,17 @@ int main(void) {
   unlink(path);
   CHECK_EQ(mpcua_cfg_load(&c, path, err, sizeof err), 0);    /* missing file: defaults */
   CHECK_EQ(c.enabled, 1);
+  /* wide layouts: 27 channels each way, hs_bint lowered to fit a 1024-byte packet */
+  mpcua_cfg_defaults(&c);
+  CHECK_EQ(c.wide_out, 0u); CHECK_EQ(c.hs_bint, 4u);
+  CHECK_EQ(mpcua_cfg_parse(&c, "wide_out=32\nwide_in=27\nto_host=out1-27\nhost_channels=27\n"
+                               "to_mpc_in=host1-27\n", err, sizeof err), 0);
+  CHECK_EQ(c.wide_out, 32u); CHECK_EQ(c.wide_in, 27u); CHECK_EQ(c.n_to_host, 27); CHECK_EQ(c.n_to_mpc, 27);
+  CHECK_EQ(c.hs_bint_cfg, 4u); CHECK_EQ(c.hs_bint, 1u);
+  CHECK(mpcua_usb_packet_bytes(27, 4, 44100, 1) <= 1024);
+  CHECK_EQ(mpcua_usb_packet_bytes(4, 4, 44100, 4), 720u);
+  mpcua_cfg_defaults(&c);
+  CHECK_EQ(mpcua_cfg_parse(&c, "wide_out=1\nwide_in=33\nhost_channels=28\nto_host=out1-28\n", err, sizeof err), 4);
+  CHECK_EQ(c.wide_out, 0u); CHECK_EQ(c.wide_in, 0u); CHECK_EQ(c.n_to_host, 4);
   T_DONE("config");
 }

@@ -7,14 +7,15 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef struct { int card, stream; } fake_pcm;
-typedef struct { int fmt; unsigned ch, rate; int access; } fake_hw;
+typedef struct { int card, stream; unsigned ch; } fake_pcm;
+typedef struct { int fmt; unsigned ch, rate; int access; unsigned maxch; } fake_hw;
 typedef struct { int card; } fake_info;
 
 int fake_cap_s16 = 100;              /* what fake readi returns, per S16 sample */
@@ -29,7 +30,23 @@ int snd_pcm_open(fake_pcm **p, const char *name, int stream, int mode) {
   return 0;
 }
 int snd_pcm_close(fake_pcm *p) { free(p); return 0; }
-int snd_pcm_hw_params(fake_pcm *p, fake_hw *h) { (void)p; (void)h; return 0; }
+int snd_pcm_hw_params(fake_pcm *p, fake_hw *h) { p->ch = h->ch; return 0; }
+/* channel negotiation: the fake codec has h->maxch channels (2 after _any) */
+#define MAXCH(h) ((h)->maxch ? (h)->maxch : 2u)
+int snd_pcm_hw_params_any(fake_pcm *p, fake_hw *h) { (void)p; memset(h, 0, sizeof *h); h->maxch = 2; return 0; }
+int snd_pcm_hw_params_current(fake_pcm *p, fake_hw *h) { memset(h, 0, sizeof *h); h->ch = p->ch; h->maxch = 2; return 0; }
+int snd_pcm_hw_params_get_channels_max(const fake_hw *h, unsigned *v) { *v = MAXCH(h); return 0; }
+int snd_pcm_hw_params_test_channels(fake_pcm *p, fake_hw *h, unsigned v) { (void)p; return v >= 1 && v <= MAXCH(h) ? 0 : -EINVAL; }
+int snd_pcm_hw_params_set_channels(fake_pcm *p, fake_hw *h, unsigned v) {
+  (void)p; if (v < 1 || v > MAXCH(h)) return -EINVAL; h->ch = v; return 0;
+}
+int snd_pcm_hw_params_set_channels_near(fake_pcm *p, fake_hw *h, unsigned *v) {
+  (void)p; if (*v > MAXCH(h)) *v = MAXCH(h); if (*v < 1) *v = 1; h->ch = *v; return 0;
+}
+int snd_pcm_hw_params_set_channels_min(fake_pcm *p, fake_hw *h, unsigned *v) { (void)p; return *v <= MAXCH(h) ? 0 : -EINVAL; }
+long snd_pcm_frames_to_bytes(fake_pcm *p, long f) { return f * (long)(p->ch ? p->ch : 2) * 4; }
+long snd_pcm_bytes_to_frames(fake_pcm *p, long b) { return b / ((long)(p->ch ? p->ch : 2) * 4); }
+int32_t fake_wbuf[4096]; unsigned long fake_wbuf_samples;
 int snd_pcm_hw_params_get_format(const fake_hw *h, int *v) { *v = h->fmt; return 0; }
 int snd_pcm_hw_params_get_channels(const fake_hw *h, unsigned *v) { *v = h->ch; return 0; }
 int snd_pcm_hw_params_get_rate(const fake_hw *h, unsigned *v, int *d) { *v = h->rate; if (d) *d = 0; return 0; }
@@ -37,7 +54,13 @@ int snd_pcm_hw_params_get_access(const fake_hw *h, int *v) { *v = h->access; ret
 size_t snd_pcm_info_sizeof(void) { return sizeof(fake_info); }
 int snd_pcm_info(fake_pcm *p, fake_info *i) { i->card = p->card; return 0; }
 int snd_pcm_info_get_card(const fake_info *i) { return i->card; }
-long snd_pcm_writei(fake_pcm *p, const void *b, unsigned long n) { (void)p; (void)b; fake_writei_calls++; return (long)n; }
+long snd_pcm_writei(fake_pcm *p, const void *b, unsigned long n) {
+  fake_writei_calls++;
+  fake_wbuf_samples = n * (p->ch ? p->ch : 2);   /* what the codec got, read as S32 */
+  if (fake_wbuf_samples > 4096) fake_wbuf_samples = 4096;
+  memcpy(fake_wbuf, b, fake_wbuf_samples * 4);
+  return (long)n;
+}
 long snd_pcm_writen(fake_pcm *p, void **b, unsigned long n) { (void)p; (void)b; return (long)n; }
 long snd_pcm_readi(fake_pcm *p, void *b, unsigned long n) {
   (void)p; fake_readi_calls++;
