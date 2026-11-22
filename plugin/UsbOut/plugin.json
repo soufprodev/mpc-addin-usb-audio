@@ -1,0 +1,17 @@
+{
+  "name": "USB Out",
+  "manufacturer": "MPC USB Audio",
+  "version": "1.0.0",
+  "format": "vst2",
+  "kind": "effect",
+  "uid": "UsbO",
+  "numInputs": 2,
+  "numOutputs": 2,
+  "category": "Effect",
+  "file32": "VST/usb-out-arm32.so",
+  "file64": "VST/usb-out-arm64.so",
+  "description": "Sends this track (or pad, or bus) to its own channel of the MPC USB Audio device, for multitrack recording into a computer. Needs the mpc-addin-usb-audio addin.",
+  "author": "MPC USB Audio",
+  "url": "https://github.com/jacob-sabella/mpc-addin-usb-audio",
+  "license": "MIT"
+}
