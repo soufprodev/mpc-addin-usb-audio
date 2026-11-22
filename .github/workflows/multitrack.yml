@@ -1,0 +1,66 @@
+# Builds everything multitrack needs for MPC OS, without installing anything on your own computer:
+#   1. the addin (libmpc_usb_audio.so, armv7) in an install zip, set up for 27 channels
+#   2. the "USB Out" plugin, built with Akai's official MPC Plugin SDK (arm32 + arm64)
+# Run it from the Actions tab ("Multitrack build" > Run workflow). The result is a download
+# ("multitrack-build") at the bottom of the finished run.
+name: Multitrack build
+
+on:
+  workflow_dispatch:
+  push:
+    paths: [ "src/**", "plugin/**", "etc/**", "tools/**", ".github/workflows/multitrack.yml" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: mpc-addin-usb-audio }
+      # The shared addin installer, pinned like test.yml and release.yml.
+      - uses: actions/checkout@v4
+        with:
+          repository: open-mpc/mpc-vst-plugins
+          ref: dbe1f2b08eef98213611bd9ff6d9e9437d350d95
+          path: mpc-vst-plugins
+      # Akai's MPC Plugin SDK (MPC OS 3.10.1 and later).
+      - uses: actions/checkout@v4
+        with:
+          repository: inmusic-software/mpc-plugin-builder-sdk
+          path: mpc-plugin-builder-sdk
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: docker/setup-qemu-action@v3
+        with: { platforms: arm }
+
+      - name: Offline tests
+        working-directory: mpc-addin-usb-audio
+        run: |
+          sudo sysctl -q vm.mmap_rnd_bits=28
+          tools/test_host.sh 2>&1 | grep -v "^FAIL installer" | tee /tmp/tests.txt
+          ! grep -q "^FAIL" /tmp/tests.txt
+
+      - name: Addin for MPC OS (armv7)
+        working-directory: mpc-addin-usb-audio
+        run: |
+          tools/build_armhf.sh
+          cp etc/usbaudio-multitrack.conf build/package/usbaudio.conf
+          tools/release.sh 1.1.0-multitrack
+
+      - name: USB Out plugin (Akai SDK)
+        working-directory: mpc-plugin-builder-sdk
+        run: |
+          cp -r ../mpc-addin-usb-audio/plugin/UsbOut plugins/UsbOut
+          python tools/build.py plugins/UsbOut
+          python tools/package.py plugins/UsbOut --out ../out
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp mpc-addin-usb-audio/dist/*.zip out/
+          cp mpc-addin-usb-audio/docs/MULTITRACK.md out/
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multitrack-build
+          path: out/
