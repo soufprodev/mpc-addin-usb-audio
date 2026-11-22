@@ -44,7 +44,7 @@ jobs:
         run: |
           tools/build_armhf.sh
           cp etc/usbaudio-multitrack.conf build/package/usbaudio.conf
-          tools/release.sh 1.1.0-multitrack
+          tools/release.sh 1.3.0
 
       - name: USB Out plugin (Akai SDK)
         working-directory: mpc-plugin-builder-sdk
