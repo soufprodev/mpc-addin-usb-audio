@@ -7,8 +7,20 @@ name: Multitrack build
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the kit as a public GitHub Release (a permanent download link)
+        type: boolean
+        default: false
   push:
     paths: [ "src/**", "plugin/**", "etc/**", "tools/**", ".github/workflows/multitrack.yml" ]
+
+env:
+  VERSION: 1.3.1
+
+# contents: write lets "Publish release" below create the release; nothing else writes.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -44,7 +56,7 @@ jobs:
         run: |
           tools/build_armhf.sh
           cp etc/usbaudio-multitrack.conf build/package/usbaudio.conf
-          tools/release.sh 1.3.1
+          tools/release.sh "$VERSION"
 
       - name: USB Out plugin (Akai SDK)
         working-directory: mpc-plugin-builder-sdk
@@ -86,3 +98,15 @@ jobs:
         with:
           name: MPC-Multitrack-Kit
           path: kit/
+
+      # Only on a manual run with "publish" ticked: the kit, zipped, as a public release.
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd kit && zip -qr "../MPC-Multitrack-Kit-$VERSION.zip" MPC-Multitrack-Kit)
+          gh release delete "multitrack-v$VERSION" --yes --cleanup-tag -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "multitrack-v$VERSION" "MPC-Multitrack-Kit-$VERSION.zip" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --latest --title "MPC Multitrack Kit $VERSION" \
+            --notes-file mpc-addin-usb-audio/kit/RELEASE_NOTES.md
