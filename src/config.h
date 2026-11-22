@@ -17,11 +17,12 @@ typedef struct {
   char configfs[128];       /* configfs=/sys/kernel/config/usb_gadget */
   unsigned rate;            /* rate=44100         (must equal MPC's codec rate) */
   unsigned sample_bytes;    /* sample_bytes=4     (2, 3 or 4 on the USB side) */
-  char to_host[128];        /* to_host=out1,out2,in1,in2 */
+  char to_host[256];        /* to_host=out1,out2,in1,in2 (ranges: out1-27) */
   unsigned host_channels;   /* host_channels=2    (computer -> MPC; 0 disables) */
-  char to_mpc_in[128];      /* to_mpc_in=host1,host2 */
+  char to_mpc_in[256];      /* to_mpc_in=host1,host2 (ranges: host1-27) */
   int input_mode;           /* input_mode=sum | replace | off */
-  unsigned hs_bint;         /* hs_bint=4          (USB interval 2^(n-1) x 125 us) */
+  unsigned hs_bint;         /* hs_bint=4          (USB interval 2^(n-1) x 125 us; lowered to fit, see below) */
+  unsigned hs_bint_cfg;     /* what the file asked for; hs_bint is lowered when a packet would pass 1024 bytes */
   unsigned req_number;      /* req_number=0       (0 = kernel default) */
   int iad_class;            /* iad_class=1        (device class EF/02/01 for composite + IAD) */
   char function_name[64];   /* function_name=MPC USB Audio */
@@ -35,14 +36,20 @@ typedef struct {
   int standalone_create;    /* standalone_create=1 (no gadget from MPC: create our own, own_gadget) */
   char own_gadget[64];      /* own_gadget=mpcusbaudio */
   int own_wait;             /* own_wait=30        (seconds to wait for MPC's gadget first) */
+  unsigned wide_out;        /* wide_out=0         (>0: MPC is told the codec has this many playback channels) */
+  unsigned wide_in;         /* wide_in=0          (>0: ... and this many capture channels) */
   int hub_mux_check;        /* hub_mux_check=1    (build nothing behind an 'internal' USB hub mux: Force, Live II, X) */
   char log_path[160];       /* log=auto: usbaudio.log next to the .so; a path; "" disables */
 
   mpcua_chsrc to_host_map[MPCUA_MAX_CH]; int n_to_host;
+  unsigned n_send;          /* send channels to_host uses (send1..sendN): the USB Out plugin's channels */
   mpcua_chsrc to_mpc_map[MPCUA_MAX_CH];  int n_to_mpc;
 } mpcua_cfg;
 
 void mpcua_cfg_defaults(mpcua_cfg *c);
+/* Largest isochronous packet f_uac2 will ask for (its own formula, fb_max 5), in bytes. A high-speed
+ * endpoint carries at most 1024. */
+unsigned mpcua_usb_packet_bytes(unsigned ch, unsigned ssize, unsigned rate, unsigned bint);
 /* Parse text into c (on top of whatever is there). Returns the number of problems; the first is
  * described in err. Bad values keep the previous value. Ends with mpcua_cfg_finish. */
 int mpcua_cfg_parse(mpcua_cfg *c, const char *text, char *err, size_t errlen);

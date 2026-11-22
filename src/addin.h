@@ -15,8 +15,9 @@ typedef struct {
   _Atomic int ok;
   _Atomic unsigned gen;     /* bumped on every hw_params/close, so the forwarder can resync */
   mpcua_fmt fmt;
-  unsigned ch, rate;
+  unsigned ch, rate;        /* ch: channels as MPC sees them (wider than the codec with wide_out/wide_in) */
   int interleaved;
+  _Atomic unsigned wide_hw; /* 0, or the codec's real channel count when MPC opened it wider (wide_out/wide_in) */
   _Atomic unsigned long calls, frames;   /* MPC's reads/writes on this PCM, frames tapped (for the stats) */
   _Atomic uint32_t peak;                 /* largest |sample| tapped since the last stats line */
 } mpcua_stream;

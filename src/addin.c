@@ -8,6 +8,9 @@
  *   2. hooks snd_pcm_open/hw_params/close to find MPC's playback and capture PCMs on the codec card;
  *   3. hooks snd_pcm_writei/readi (and the non-interleaved variants) to copy main out and inputs into
  *      lock-free rings, and to mix computer playback into what MPC reads from its inputs.
+ *   4. with wide_out/wide_in, hooks MPC's channel negotiation on the codec so MPC opens it with more
+ *      channels than the codec has (up to 32). The codec gets its real channels; the rest exist only
+ *      on USB. If MPC routes tracks to those extra outputs, each arrives on its own USB channel.
  * The gadget's ALSA PCMs are serviced by the forwarder thread (fwd.c).
  *
  * Audio-thread rules (writei/readi/writen/readn): no locks, no allocation, no syscalls beyond the real
@@ -34,6 +37,7 @@
 
 #include "gadget.h"
 #include "log.h"
+#include "send.h"
 
 /* Only the hooks (and test helpers) are exported; everything else is built hidden. */
 #define EXPORT __attribute__((visibility("default")))
@@ -278,6 +282,9 @@ __attribute__((constructor)) static void mpcua_ctor(void) {
     if (g_ua.cfg.to_host_map[i].kind == MPCUA_SRC_IN) g_ua.need_in = 1;
   atomic_store(&g_ua.tap_card, resolve_tap_card(&g_ua.cfg));
   g_ua.active = 1;
+  mpcua_send_enable(g_ua.cfg.n_send);
+  if (g_ua.cfg.n_send)
+    mpcua_log("send bus: %u channels for the USB Out plugin (send1..send%u)", g_ua.cfg.n_send, g_ua.cfg.n_send);
   int tap = atomic_load(&g_ua.tap_card);
   if (tap >= 0)
     mpcua_log("active: gadget '%s', %d ch to computer, %u from it, %u Hz, codec card %d",
@@ -286,6 +293,13 @@ __attribute__((constructor)) static void mpcua_ctor(void) {
     mpcua_log("active: gadget '%s', %d ch to computer, %u from it, %u Hz, no platform codec: "
               "the first card MPC opens", g_ua.cfg.gadget, g_ua.cfg.n_to_host, g_ua.cfg.host_channels,
               g_ua.cfg.rate);
+  if (g_ua.cfg.wide_out || g_ua.cfg.wide_in)
+    mpcua_log("wide codec: MPC may open up to %u playback / %u capture channels (0 = as the codec has)",
+              g_ua.cfg.wide_out, g_ua.cfg.wide_in);
+  if (g_ua.cfg.hs_bint != g_ua.cfg.hs_bint_cfg)
+    mpcua_log("hs_bint %u -> %u: %d/%u channels at %u bytes would not fit a 1024-byte USB packet",
+              g_ua.cfg.hs_bint_cfg, g_ua.cfg.hs_bint, g_ua.cfg.n_to_host, g_ua.cfg.host_channels,
+              g_ua.cfg.sample_bytes);
   char mux[32] = "";
   int hm = g_ua.cfg.hub_mux_check ? mpcua_hub_mux_state(mux_dir(), mux, sizeof mux) : 0;
   if (hm > 0 && !strcmp(mux, "internal")) {
@@ -391,6 +405,208 @@ static mpcua_stream *stream_of(snd_pcm_t *pcm) {
   return NULL;
 }
 
+/* ---- wide codec (wide_out / wide_in, MPC setup threads) -------------------------------------
+ *
+ * MPC sizes its outputs and inputs from what the codec PCM reports. With wide_out=N the codec's
+ * playback PCM reports N channels at most (wide_in: capture), and a request for up to N is accepted:
+ * the real PCM is set to its own maximum, and the hw_params structure remembers the channel count
+ * MPC asked for, so MPC reads that count back. The audio hooks then pass the codec its channels and
+ * stream all of them to USB.
+ *
+ * hw_params structures are tracked by address from snd_pcm_hw_params_any (or _current) on a tapped
+ * codec PCM; any other PCM's structures are never touched. */
+
+#define WIDE_SLOTS 16
+typedef struct { const snd_pcm_hw_params_t *params; snd_pcm_t *pcm; unsigned virt; } wide_slot;
+static wide_slot wide_tab[WIDE_SLOTS];
+static unsigned wide_next;
+static pthread_mutex_t wide_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int (*real_hw_any)(snd_pcm_t *, snd_pcm_hw_params_t *);
+static int (*real_hw_current)(snd_pcm_t *, snd_pcm_hw_params_t *);
+static int (*real_get_ch)(const snd_pcm_hw_params_t *, unsigned *);
+static int (*real_get_ch_max)(const snd_pcm_hw_params_t *, unsigned *);
+static int (*real_test_ch)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned);
+static int (*real_set_ch)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned);
+static int (*real_set_ch_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned *);
+static int (*real_set_ch_min)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned *);
+
+static void resolve_wide(void) {
+  if (real_set_ch) return;
+  *(void **)&real_hw_any = dlsym(RTLD_NEXT, "snd_pcm_hw_params_any");
+  *(void **)&real_hw_current = dlsym(RTLD_NEXT, "snd_pcm_hw_params_current");
+  *(void **)&real_get_ch = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_channels");
+  *(void **)&real_get_ch_max = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_channels_max");
+  *(void **)&real_test_ch = dlsym(RTLD_NEXT, "snd_pcm_hw_params_test_channels");
+  *(void **)&real_set_ch_near = dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_channels_near");
+  *(void **)&real_set_ch_min = dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_channels_min");
+  *(void **)&real_set_ch = dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_channels");
+}
+
+/* Channels MPC may see on this stream: wide_out/wide_in, or 0 when the stream is not widened. */
+static unsigned wide_of(mpcua_stream *s) {
+  if (!s || !g_ua.active) return 0;
+  return s == &g_ua.play ? g_ua.cfg.wide_out : g_ua.cfg.wide_in;
+}
+
+static const char *what_of(mpcua_stream *s) { return s == &g_ua.play ? "playback" : "capture"; }
+
+/* Remember (or forget, pcm NULL) a hw_params structure. */
+static void slot_set(const snd_pcm_hw_params_t *params, snd_pcm_t *pcm, unsigned virt) {
+  pthread_mutex_lock(&wide_lock);
+  wide_slot *hit = NULL;
+  for (unsigned i = 0; i < WIDE_SLOTS && !hit; i++)
+    if (wide_tab[i].params == params) hit = &wide_tab[i];
+  if (!hit && pcm) { hit = &wide_tab[wide_next]; wide_next = (wide_next + 1) % WIDE_SLOTS; }
+  if (hit) {
+    hit->params = pcm ? params : NULL;
+    hit->pcm = pcm;
+    hit->virt = virt;
+  }
+  pthread_mutex_unlock(&wide_lock);
+}
+
+/* The tracked PCM of a hw_params structure, and the channel count MPC chose on it (0: none yet). */
+static snd_pcm_t *slot_get(const snd_pcm_hw_params_t *params, unsigned *virt) {
+  snd_pcm_t *pcm = NULL;
+  pthread_mutex_lock(&wide_lock);
+  for (unsigned i = 0; i < WIDE_SLOTS; i++)
+    if (wide_tab[i].params == params) { pcm = wide_tab[i].pcm; if (virt) *virt = wide_tab[i].virt; break; }
+  pthread_mutex_unlock(&wide_lock);
+  return pcm;
+}
+
+/* The codec's own channel maximum for this configuration space. */
+static unsigned hw_max(const snd_pcm_hw_params_t *params) {
+  unsigned m = 0;
+  if (!real_get_ch_max || real_get_ch_max(params, &m) < 0) return 0;
+  return m;
+}
+
+EXPORT int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params) {
+  resolve_wide();
+  if (!real_hw_any) return -ENOSYS;
+  int r = real_hw_any(pcm, params);
+  if (r >= 0 && g_ua.active) slot_set(params, wide_of(stream_of(pcm)) ? pcm : NULL, 0);
+  return r;
+}
+
+EXPORT int snd_pcm_hw_params_current(snd_pcm_t *pcm, snd_pcm_hw_params_t *params) {
+  resolve_wide();
+  if (!real_hw_current) return -ENOSYS;
+  int r = real_hw_current(pcm, params);
+  if (r >= 0 && g_ua.active) {
+    mpcua_stream *s = stream_of(pcm);
+    int wide = wide_of(s) && atomic_load(&s->wide_hw);
+    slot_set(params, wide ? pcm : NULL, wide ? s->ch : 0);
+  }
+  return r;
+}
+
+EXPORT int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *params, unsigned *val) {
+  resolve_wide();
+  if (!real_get_ch_max) return -ENOSYS;
+  int r = real_get_ch_max(params, val);
+  snd_pcm_t *pcm = r >= 0 && g_ua.active ? slot_get(params, NULL) : NULL;
+  mpcua_stream *s = pcm ? stream_of(pcm) : NULL;
+  unsigned n = wide_of(s);
+  if (n > *val) {
+    static unsigned told[2];
+    unsigned *t = &told[s == &g_ua.cap];
+    if (*t != n) { *t = n; mpcua_log("%s: MPC asked for the codec's channel count: told it %u (the codec has %u)", what_of(s), n, *val); }
+    *val = n;
+  }
+  return r;
+}
+
+EXPORT int snd_pcm_hw_params_get_channels(const snd_pcm_hw_params_t *params, unsigned *val) {
+  resolve_wide();
+  if (!real_get_ch) return -ENOSYS;
+  int r = real_get_ch(params, val);
+  unsigned virt = 0;
+  if (g_ua.active && slot_get(params, &virt) && virt) { *val = virt; return 0; }
+  return r;
+}
+
+EXPORT int snd_pcm_hw_params_test_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned val) {
+  resolve_wide();
+  if (!real_test_ch) return -ENOSYS;
+  unsigned n = wide_of(stream_of(pcm)), m = n ? hw_max(params) : 0;
+  if (n && m && val > m && val <= n) return real_test_ch(pcm, params, m);
+  return real_test_ch(pcm, params, val);
+}
+
+/* MPC asks for `want` channels on a widened stream: give the codec its maximum, remember `want`. */
+static int widen(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned want, int (*set)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned)) {
+  mpcua_stream *s = stream_of(pcm);
+  unsigned m = hw_max(params);
+  int r = set(pcm, params, m);
+  if (r >= 0) {
+    slot_set(params, pcm, want);
+    mpcua_log("%s: MPC asked for %u channels; the codec gets %u, channels %u-%u go to USB only", what_of(s), want, m, m + 1, want);
+  }
+  return r;
+}
+
+static int set_exact(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned v) { return real_set_ch(pcm, params, v); }
+static int set_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned v) { return real_set_ch_near(pcm, params, &v); }
+static int set_min(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned v) { return real_set_ch_min(pcm, params, &v); }
+
+EXPORT int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned val) {
+  resolve_wide();
+  if (!real_set_ch) return -ENOSYS;
+  mpcua_stream *s = stream_of(pcm);
+  unsigned n = wide_of(s), m = n ? hw_max(params) : 0;
+  if (n) mpcua_log("%s: MPC sets %u channels (wide_%s=%u, codec max %u)", what_of(s), val, s == &g_ua.play ? "out" : "in", n, m);
+  if (n && m && val > m && val <= n) return widen(pcm, params, val, set_exact);
+  return real_set_ch(pcm, params, val);
+}
+
+EXPORT int snd_pcm_hw_params_set_channels_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned *val) {
+  resolve_wide();
+  if (!real_set_ch_near) return -ENOSYS;
+  unsigned n = wide_of(stream_of(pcm)), m = n ? hw_max(params) : 0;
+  if (n && m && *val > m) {
+    unsigned want = *val < n ? *val : n;
+    int r = widen(pcm, params, want, set_near);
+    if (r >= 0) *val = want;
+    return r;
+  }
+  return real_set_ch_near(pcm, params, val);
+}
+
+EXPORT int snd_pcm_hw_params_set_channels_min(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned *val) {
+  resolve_wide();
+  if (!real_set_ch_min) return -ENOSYS;
+  unsigned n = wide_of(stream_of(pcm)), m = n ? hw_max(params) : 0;
+  if (n && m && *val > m && *val <= n) return widen(pcm, params, *val, set_min);
+  return real_set_ch_min(pcm, params, val);
+}
+
+/* Byte/frame conversions on a widened PCM follow MPC's channel count, so buffers MPC sizes with them
+ * hold its wide frames. */
+static snd_pcm_sframes_t (*real_f2b)(snd_pcm_t *, snd_pcm_sframes_t);
+static snd_pcm_sframes_t (*real_b2f)(snd_pcm_t *, ssize_t);
+
+static mpcua_stream *wide_stream(snd_pcm_t *pcm) {
+  mpcua_stream *s = g_ua.active ? stream_of(pcm) : NULL;
+  return s && atomic_load(&s->wide_hw) && mpcua_fmt_bytes(s->fmt) ? s : NULL;
+}
+
+EXPORT ssize_t snd_pcm_frames_to_bytes(snd_pcm_t *pcm, snd_pcm_sframes_t frames) {
+  if (!real_f2b) *(void **)&real_f2b = dlsym(RTLD_NEXT, "snd_pcm_frames_to_bytes");
+  mpcua_stream *s = wide_stream(pcm);
+  if (s) return (ssize_t)frames * (ssize_t)(mpcua_fmt_bytes(s->fmt) * s->ch);
+  return real_f2b ? real_f2b(pcm, frames) : -ENOSYS;
+}
+
+EXPORT snd_pcm_sframes_t snd_pcm_bytes_to_frames(snd_pcm_t *pcm, ssize_t bytes) {
+  if (!real_b2f) *(void **)&real_b2f = dlsym(RTLD_NEXT, "snd_pcm_bytes_to_frames");
+  mpcua_stream *s = wide_stream(pcm);
+  if (s) return (snd_pcm_sframes_t)(bytes / (ssize_t)(mpcua_fmt_bytes(s->fmt) * s->ch));
+  return real_b2f ? real_b2f(pcm, bytes) : -ENOSYS;
+}
+
 EXPORT int snd_pcm_open(snd_pcm_t **pcmp, const char *name, int stream, int mode) {
   if (!real_open) resolve_reals();
   if (!real_open) return -ENOSYS;
@@ -411,6 +627,7 @@ EXPORT int snd_pcm_open(snd_pcm_t **pcmp, const char *name, int stream, int mode
   if (card != tap) return r;
   mpcua_stream *s = stream == MPCUA_PCM_PLAYBACK ? &g_ua.play : &g_ua.cap;
   atomic_store(&s->ok, 0);
+  atomic_store(&s->wide_hw, 0);
   atomic_store(&s->pcm, *pcmp);
   atomic_fetch_add(&s->gen, 1);
   mpcua_log("tapping %s PCM '%s' (card %d)", stream == MPCUA_PCM_PLAYBACK ? "playback" : "capture",
@@ -433,15 +650,21 @@ EXPORT int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params) {
   a->hw_get_channels(params, &ch);
   a->hw_get_rate(params, &rate, &dir);
   a->hw_get_access(params, &access);
+  unsigned virt = 0, codec_ch = 0;
+  atomic_store(&s->wide_hw, 0);
+  if (wide_of(s) && slot_get(params, &virt) && virt > ch) { codec_ch = ch; ch = virt; }   /* MPC reads/writes virt */
   s->fmt = mpcua_fmt_from_alsa(fmt);
   s->ch = ch;
   s->rate = rate;
   s->interleaved = access == MPCUA_ACCESS_RW_INTERLEAVED;
+  atomic_store_explicit(&s->wide_hw, codec_ch, memory_order_release);
   atomic_fetch_add(&s->gen, 1);
   const char *what = s == &g_ua.play ? "playback" : "capture";
   if (s->fmt == MPCUA_FMT_UNKNOWN || ch < 1 || ch > MPCUA_MAX_CH ||
       (access != MPCUA_ACCESS_RW_INTERLEAVED && access != MPCUA_ACCESS_RW_NONINTERLEAVED)) {
     mpcua_log("%s: unsupported format %d / %u ch / access %d; not tapping", what, fmt, ch, access);
+    if (atomic_load(&s->wide_hw))
+      mpcua_log("%s: MPC opened it wide but the format is unknown: its extra channels cannot be split off", what);
     return r;
   }
   if (rate != g_ua.cfg.rate) {
@@ -450,8 +673,13 @@ EXPORT int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params) {
     return r;
   }
   atomic_store_explicit(&s->ok, 1, memory_order_release);
-  mpcua_log("%s: %u ch, format %d, %u Hz, %s", what, ch, fmt, rate,
-            s->interleaved ? "interleaved" : "non-interleaved");
+  unsigned hw = atomic_load(&s->wide_hw);
+  if (hw)
+    mpcua_log("%s: %u ch as MPC sees it (codec %u, the rest USB only), format %d, %u Hz, %s", what, ch, hw, fmt,
+              rate, s->interleaved ? "interleaved" : "non-interleaved");
+  else
+    mpcua_log("%s: %u ch, format %d, %u Hz, %s", what, ch, fmt, rate,
+              s->interleaved ? "interleaved" : "non-interleaved");
   return r;
 }
 
@@ -462,6 +690,7 @@ EXPORT int snd_pcm_close(snd_pcm_t *pcm) {
   if (s) {
     atomic_store(&s->ok, 0);
     atomic_store(&s->pcm, NULL);
+    atomic_store(&s->wide_hw, 0);
     atomic_fetch_add(&s->gen, 1);
   }
   return real_close(pcm);
@@ -518,6 +747,33 @@ static void tap_n(mpcua_stream *s, mpcua_ring *q, void **bufs, uint32_t frames,
   mpcua_ring_wcommit(q, frames * ch);
 }
 
+/* Main out with send channels: each frame is MPC's playback channels, then the send bus's channels
+ * for the same moment. `bufs` is NULL for an interleaved `buf`. The bus is always taken (so it never
+ * fills with stale audio), even while nothing is tapped. */
+#define SEND_CHUNK 128
+static int32_t send_frames[SEND_CHUNK * MPCUA_MAX_CH * 2];
+
+static void tap_sends(mpcua_stream *s, const void *buf, void **bufs, uint32_t frames) {
+  unsigned ns = g_ua.cfg.n_send, pc = s->ch, w = pc + ns;
+  int tap = tapping(s) && s->fmt != MPCUA_FMT_UNKNOWN;
+  for (uint32_t done = 0; done < frames;) {
+    uint32_t k = frames - done < SEND_CHUNK ? frames - done : SEND_CHUNK;
+    if (!tap) { mpcua_send_take(NULL, 0, ns, k); done += k; continue; }
+    for (uint32_t i = 0; i < k; i++)
+      for (unsigned c = 0; c < pc; c++) {
+        size_t j = (size_t)(done + i);
+        send_frames[(size_t)i * w + c] =
+            bufs ? (bufs[c] ? mpcua_fmt_get(bufs[c], s->fmt, j) : 0) : mpcua_fmt_get(buf, s->fmt, j * pc + c);
+      }
+    mpcua_send_take(send_frames + pc, w, ns, k);
+    note_peak(s, send_frames, k * w);
+    uint32_t put = mpcua_ring_write_frames(&g_ua.out_ring, send_frames, k, w);
+    if (put < k) atomic_fetch_add_explicit(&g_ua.ovf_out, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->frames, put, memory_order_relaxed);
+    done += k;
+  }
+}
+
 /* Mix (or replace) computer audio into what MPC just read from its inputs. `bufs` is NULL for an
  * interleaved `buf`. */
 static void inject(void *buf, void **bufs, uint32_t frames) {
@@ -546,35 +802,81 @@ static void inject(void *buf, void **bufs, uint32_t frames) {
   mpcua_ring_rcommit(&g_ua.host_ring, k * ch);
 }
 
+/* Wide streams: MPC's buffers carry s->ch channels, the codec takes hw of them. These run on MPC's
+ * audio thread: static buffers, plain copies, no locks. One buffer per direction (MPC has one
+ * playback and one capture thread at most on the codec). */
+#define WIDE_BUF_BYTES 65536
+static unsigned char wide_wbuf[WIDE_BUF_BYTES], wide_rbuf[WIDE_BUF_BYTES];
+
+static snd_pcm_sframes_t wide_writei(mpcua_stream *s, snd_pcm_t *pcm, const void *buf, snd_pcm_uframes_t n,
+                                     unsigned hw) {
+  size_t sb = mpcua_fmt_bytes(s->fmt), vf = sb * s->ch, hf = sb * hw;
+  if (!sb || s->ch <= hw) return real_writei(pcm, buf, n);
+  snd_pcm_uframes_t cap = WIDE_BUF_BYTES / hf, done = 0;
+  while (done < n) {
+    snd_pcm_uframes_t k = n - done < cap ? n - done : cap;
+    const unsigned char *src = (const unsigned char *)buf + done * vf;
+    for (snd_pcm_uframes_t i = 0; i < k; i++) memcpy(wide_wbuf + i * hf, src + i * vf, hf);
+    snd_pcm_sframes_t r = real_writei(pcm, wide_wbuf, k);
+    if (r < 0) return done ? (snd_pcm_sframes_t)done : r;
+    done += (snd_pcm_uframes_t)r;
+    if ((snd_pcm_uframes_t)r < k) break;
+  }
+  return (snd_pcm_sframes_t)done;
+}
+
+static snd_pcm_sframes_t wide_readi(mpcua_stream *s, snd_pcm_t *pcm, void *buf, snd_pcm_uframes_t n, unsigned hw) {
+  size_t sb = mpcua_fmt_bytes(s->fmt), vf = sb * s->ch, hf = sb * hw;
+  if (!sb || s->ch <= hw) return real_readi(pcm, buf, n);
+  snd_pcm_uframes_t cap = WIDE_BUF_BYTES / hf, done = 0;
+  while (done < n) {
+    snd_pcm_uframes_t k = n - done < cap ? n - done : cap;
+    snd_pcm_sframes_t r = real_readi(pcm, wide_rbuf, k);
+    if (r < 0) return done ? (snd_pcm_sframes_t)done : r;
+    unsigned char *dst = (unsigned char *)buf + done * vf;
+    for (snd_pcm_sframes_t i = 0; i < r; i++) {
+      memcpy(dst + (size_t)i * vf, wide_rbuf + (size_t)i * hf, hf);
+      memset(dst + (size_t)i * vf + hf, 0, vf - hf);   /* inputs beyond the codec: silence until the computer fills them */
+    }
+    done += (snd_pcm_uframes_t)r;
+    if ((snd_pcm_uframes_t)r < k) break;
+  }
+  return (snd_pcm_sframes_t)done;
+}
+
 EXPORT snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buf, snd_pcm_uframes_t n) {
   if (!real_writei) return -ENOSYS;
-  snd_pcm_sframes_t r = real_writei(pcm, buf, n);
-  if (r > 0 && pcm == atomic_load_explicit(&g_ua.play.pcm, memory_order_relaxed))
-    atomic_fetch_add_explicit(&g_ua.play.calls, 1, memory_order_relaxed);
-  if (r > 0 && pcm == atomic_load_explicit(&g_ua.play.pcm, memory_order_relaxed) &&
-      tapping(&g_ua.play) && g_ua.play.interleaved)
+  int mine = pcm == atomic_load_explicit(&g_ua.play.pcm, memory_order_relaxed);
+  unsigned hw = mine ? atomic_load_explicit(&g_ua.play.wide_hw, memory_order_acquire) : 0;
+  snd_pcm_sframes_t r = hw ? wide_writei(&g_ua.play, pcm, buf, n, hw) : real_writei(pcm, buf, n);
+  if (r > 0 && mine) atomic_fetch_add_explicit(&g_ua.play.calls, 1, memory_order_relaxed);
+  if (r > 0 && mine && g_ua.cfg.n_send && g_ua.play.interleaved)
+    tap_sends(&g_ua.play, buf, NULL, (uint32_t)r);
+  else if (r > 0 && mine && tapping(&g_ua.play) && g_ua.play.interleaved)
     tap_i(&g_ua.play, &g_ua.out_ring, buf, (uint32_t)r, &g_ua.ovf_out);
   return r;
 }
 
+/* Non-interleaved: the codec simply uses the first hw of MPC's buffers. */
 EXPORT snd_pcm_sframes_t snd_pcm_writen(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t n) {
   if (!real_writen) return -ENOSYS;
   snd_pcm_sframes_t r = real_writen(pcm, bufs, n);
   if (r > 0 && pcm == atomic_load_explicit(&g_ua.play.pcm, memory_order_relaxed))
     atomic_fetch_add_explicit(&g_ua.play.calls, 1, memory_order_relaxed);
-  if (r > 0 && pcm == atomic_load_explicit(&g_ua.play.pcm, memory_order_relaxed) &&
-      tapping(&g_ua.play) && !g_ua.play.interleaved && bufs)
-    tap_n(&g_ua.play, &g_ua.out_ring, bufs, (uint32_t)r, &g_ua.ovf_out);
+  if (r > 0 && pcm == atomic_load_explicit(&g_ua.play.pcm, memory_order_relaxed) && !g_ua.play.interleaved && bufs) {
+    if (g_ua.cfg.n_send) tap_sends(&g_ua.play, NULL, bufs, (uint32_t)r);
+    else if (tapping(&g_ua.play)) tap_n(&g_ua.play, &g_ua.out_ring, bufs, (uint32_t)r, &g_ua.ovf_out);
+  }
   return r;
 }
 
 EXPORT snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm, void *buf, snd_pcm_uframes_t n) {
   if (!real_readi) return -ENOSYS;
-  snd_pcm_sframes_t r = real_readi(pcm, buf, n);
-  if (r > 0 && pcm == atomic_load_explicit(&g_ua.cap.pcm, memory_order_relaxed))
-    atomic_fetch_add_explicit(&g_ua.cap.calls, 1, memory_order_relaxed);
-  if (r > 0 && pcm == atomic_load_explicit(&g_ua.cap.pcm, memory_order_relaxed) &&
-      g_ua.cap.interleaved) {
+  int mine = pcm == atomic_load_explicit(&g_ua.cap.pcm, memory_order_relaxed);
+  unsigned hw = mine ? atomic_load_explicit(&g_ua.cap.wide_hw, memory_order_acquire) : 0;
+  snd_pcm_sframes_t r = hw ? wide_readi(&g_ua.cap, pcm, buf, n, hw) : real_readi(pcm, buf, n);
+  if (r > 0 && mine) atomic_fetch_add_explicit(&g_ua.cap.calls, 1, memory_order_relaxed);
+  if (r > 0 && mine && g_ua.cap.interleaved) {
     if (g_ua.need_in && tapping(&g_ua.cap)) tap_i(&g_ua.cap, &g_ua.in_ring, buf, (uint32_t)r, &g_ua.ovf_in);
     inject(buf, NULL, (uint32_t)r);
   }
@@ -584,10 +886,14 @@ EXPORT snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm, void *buf, snd_pcm_uframe
 EXPORT snd_pcm_sframes_t snd_pcm_readn(snd_pcm_t *pcm, void **bufs, snd_pcm_uframes_t n) {
   if (!real_readn) return -ENOSYS;
   snd_pcm_sframes_t r = real_readn(pcm, bufs, n);
-  if (r > 0 && pcm == atomic_load_explicit(&g_ua.cap.pcm, memory_order_relaxed))
-    atomic_fetch_add_explicit(&g_ua.cap.calls, 1, memory_order_relaxed);
-  if (r > 0 && bufs && pcm == atomic_load_explicit(&g_ua.cap.pcm, memory_order_relaxed) &&
-      !g_ua.cap.interleaved) {
+  int mine = pcm == atomic_load_explicit(&g_ua.cap.pcm, memory_order_relaxed);
+  if (r > 0 && mine) atomic_fetch_add_explicit(&g_ua.cap.calls, 1, memory_order_relaxed);
+  unsigned hw = mine ? atomic_load_explicit(&g_ua.cap.wide_hw, memory_order_acquire) : 0;
+  if (r > 0 && hw && bufs) {   /* the codec filled the first hw buffers; the rest start silent */
+    size_t sb = mpcua_fmt_bytes(g_ua.cap.fmt);
+    for (unsigned c = hw; c < g_ua.cap.ch; c++) if (bufs[c]) memset(bufs[c], 0, (size_t)r * sb);
+  }
+  if (r > 0 && bufs && mine && !g_ua.cap.interleaved) {
     if (g_ua.need_in && tapping(&g_ua.cap)) tap_n(&g_ua.cap, &g_ua.in_ring, bufs, (uint32_t)r, &g_ua.ovf_in);
     inject(NULL, bufs, (uint32_t)r);
   }

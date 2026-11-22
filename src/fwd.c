@@ -26,6 +26,7 @@
 #include "chmap.h"
 #include "drift.h"
 #include "log.h"
+#include "send.h"
 
 #define SCRATCH_FRAMES 512
 #define HI_WATER_EXTRA 2048     /* frames above target before the to-computer queue is trimmed */
@@ -192,9 +193,9 @@ static int service_playback(session *S, double t) {
   const mpcua_alsa *a = &g_ua.alsa;
   const mpcua_cfg *c = &g_ua.cfg;
   if (!atomic_load(&g_ua.play.ok)) return 0;   /* MPC is reconfiguring; the gen check ends the session */
-  unsigned oc = g_ua.play.ch;
+  unsigned pc = g_ua.play.ch, ns = c->n_send, oc = pc + ns;   /* ring frames: codec channels, then sends */
   unsigned ic = (g_ua.need_in && atomic_load(&g_ua.cap.ok)) ? g_ua.cap.ch : 0;
-  if (!oc) return 0;
+  if (!pc) return 0;
   int target = c->target_frames > 0 ? c->target_frames : 256;
 
   snd_pcm_sframes_t avail = a->avail_update(S->gp);
@@ -221,7 +222,7 @@ static int service_playback(session *S, double t) {
   if (ic) mpcua_ring_read_frames(&g_ua.in_ring, s_in, k, ic);
   int nh = c->n_to_host;
   for (uint32_t i = 0; i < k; i++)
-    mpcua_chmap_frame(c->to_host_map, nh, s_out + (size_t)i * oc, oc, ic ? s_in + (size_t)i * ic : NULL,
+    mpcua_chmap_frame(c->to_host_map, nh, s_out + (size_t)i * oc, pc, ns, ic ? s_in + (size_t)i * ic : NULL,
                       ic, NULL, 0, s_usb + (size_t)i * nh);
   if (c->test_tone) {
     double inc = 2.0 * M_PI * 1000.0 / c->rate;
@@ -263,7 +264,7 @@ static int service_capture(session *S, double t) {
     int32_t *dst = s_in + (size_t)i * mc;
     for (unsigned ch = 0; ch < mc; ch++) dst[ch] = 0;
     int n = c->n_to_mpc < (int)mc ? c->n_to_mpc : (int)mc;
-    mpcua_chmap_frame(c->to_mpc_map, n, NULL, 0, NULL, 0, s_usb + (size_t)i * hc, hc, dst);
+    mpcua_chmap_frame(c->to_mpc_map, n, NULL, 0, 0, NULL, 0, s_usb + (size_t)i * hc, hc, dst);
   }
   uint32_t w = mpcua_ring_write_frames(&g_ua.host_ring, s_in, (uint32_t)r, mc);
   if (w < (uint32_t)r) atomic_fetch_add(&g_ua.ovf_host, 1);
@@ -287,7 +288,7 @@ static void service_drift(session *S, double t) {
     } else {
       snd_pcm_sframes_t d = 0;
       if (a->delay(S->gp, &d) < 0) d = 0;
-      double fill = (double)(mpcua_ring_fill(&g_ua.out_ring) / g_ua.play.ch) + (double)d;
+      double fill = (double)(mpcua_ring_fill(&g_ua.out_ring) / (g_ua.play.ch + g_ua.cfg.n_send)) + (double)d;
       pitch_set(&S->pp, S->ctl, mpcua_drift_update(&S->dp, fill, dt));
     }
   }
@@ -318,6 +319,14 @@ static void stats(session *S, double t) {
             S->pc.ok ? S->pc.last : 0, atomic_load(&g_ua.host_live) ? "live" : "idle",
             atomic_load(&g_ua.ovf_out), atomic_load(&g_ua.ovf_in), atomic_load(&g_ua.ovf_host),
             atomic_load(&g_ua.und_host));
+  if (g_ua.cfg.n_send) {
+    uint32_t seen = mpcua_send_seen();
+    char list[3 * MPCUA_SEND_MAX + 8] = "";
+    size_t L = 0;
+    for (unsigned i = 0; i < g_ua.cfg.n_send && L + 4 < sizeof list; i++)
+      if (seen & (1u << i)) L += (size_t)snprintf(list + L, sizeof list - L, "%s%u", L ? "," : "", i + 1);
+    mpcua_log("USB Out plugins sending on: %s", L ? list : "none");
+  }
   mpcua_log("tapped: main out %lu calls %lu fr peak %.1f dBFS, inputs %lu calls %lu fr peak %.1f dBFS",
             atomic_load(&g_ua.play.calls), atomic_load(&g_ua.play.frames), dbfs(atomic_exchange(&g_ua.play.peak, 0)),
             atomic_load(&g_ua.cap.calls), atomic_load(&g_ua.cap.frames), dbfs(atomic_exchange(&g_ua.cap.peak, 0)));

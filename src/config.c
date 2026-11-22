@@ -24,7 +24,7 @@ void mpcua_cfg_defaults(mpcua_cfg *c) {
   c->host_channels = 2;
   snprintf(c->to_mpc_in, sizeof c->to_mpc_in, DEF_TO_MPC);
   c->input_mode = MPCUA_INPUT_SUM;
-  c->hs_bint = 4;
+  c->hs_bint = c->hs_bint_cfg = 4;
   c->iad_class = 1;
   snprintf(c->function_name, sizeof c->function_name, "MPC USB Audio");
   c->tap_card = -1;
@@ -80,8 +80,13 @@ static int apply(mpcua_cfg *c, const char *k, const char *v) {
 #define DBL(key, field, lo, hi) if (!strcmp(k, key)) { if (to_double(v, lo, hi, &d)) return -1; c->field = d; return 0; }
   INT("enabled", enabled, 0, 1)
   INT("rate", rate, 8000, 192000)
-  INT("host_channels", host_channels, 0, MPCUA_MAX_CH)
-  INT("hs_bint", hs_bint, 1, 4)
+  INT("host_channels", host_channels, 0, MPCUA_USB_MAX_CH)
+  if (!strcmp(k, "wide_out") || !strcmp(k, "wide_in")) {
+    if (to_long(v, 0, MPCUA_MAX_CH, &l) || l == 1) return -1;
+    if (k[5] == 'o') c->wide_out = (unsigned)l; else c->wide_in = (unsigned)l;
+    return 0;
+  }
+  INT("hs_bint", hs_bint_cfg, 1, 4)
   INT("req_number", req_number, 0, 32)
   INT("iad_class", iad_class, 0, 1)
   INT("target_frames", target_frames, -1, 4096)
@@ -128,7 +133,7 @@ int mpcua_cfg_parse(mpcua_cfg *c, const char *text, char *err, size_t errlen) {
   while (p && *p) {
     const char *nl = strchr(p, '\n');
     size_t len = nl ? (size_t)(nl - p) : strlen(p);
-    char buf[256];
+    char buf[512];
     line++;
     if (len >= sizeof buf) { bad = problem(err, errlen, bad, "line too long%s (line %d)", "", line); goto next; }
     memcpy(buf, p, len); buf[len] = 0;
@@ -153,16 +158,23 @@ int mpcua_cfg_parse(mpcua_cfg *c, const char *text, char *err, size_t errlen) {
   return bad;
 }
 
+unsigned mpcua_usb_packet_bytes(unsigned ch, unsigned ssize, unsigned rate, unsigned bint) {
+  unsigned per = 8000u / (1u << (bint - 1));          /* service intervals per second */
+  unsigned r = rate * 1005u / 1000u;                  /* f_uac2: +fb_max (5 per mille), +1 frame */
+  return ch * ssize * ((r + per - 1) / per);
+}
+
 int mpcua_cfg_finish(mpcua_cfg *c, char *err, size_t errlen) {
   int rc = 0;
-  int n = mpcua_chmap_parse(c->to_host, MPCUA_SRC_OUT | MPCUA_SRC_IN, c->to_host_map, MPCUA_MAX_CH);
+  int n = mpcua_chmap_parse(c->to_host, MPCUA_SRC_OUT | MPCUA_SRC_IN | MPCUA_SRC_SEND, c->to_host_map, MPCUA_USB_MAX_CH);
   if (n < 1) {
     if (err && errlen) snprintf(err, errlen, "bad to_host '%s', using " DEF_TO_HOST, c->to_host);
     err = NULL; rc = -1;
     snprintf(c->to_host, sizeof c->to_host, DEF_TO_HOST);
-    n = mpcua_chmap_parse(c->to_host, MPCUA_SRC_OUT | MPCUA_SRC_IN, c->to_host_map, MPCUA_MAX_CH);
+    n = mpcua_chmap_parse(c->to_host, MPCUA_SRC_OUT | MPCUA_SRC_IN | MPCUA_SRC_SEND, c->to_host_map, MPCUA_USB_MAX_CH);
   }
   c->n_to_host = n;
+  c->n_send = mpcua_chmap_sends(c->to_host_map, n);
   n = mpcua_chmap_parse(c->to_mpc_in, MPCUA_SRC_HOST, c->to_mpc_map, MPCUA_MAX_CH);
   for (int i = 0; n > 0 && i < n; i++)
     if (c->to_mpc_map[i].kind == MPCUA_SRC_HOST && c->to_mpc_map[i].idx >= c->host_channels) n = -1;
@@ -175,6 +187,11 @@ int mpcua_cfg_finish(mpcua_cfg *c, char *err, size_t errlen) {
   }
   c->n_to_mpc = n;
   if (c->host_channels == 0) c->input_mode = MPCUA_INPUT_OFF;
+  /* A high-speed isochronous packet holds at most 1024 bytes: shorten the interval until the wider
+   * direction fits (27 ch x 4 bytes needs hs_bint=1). */
+  unsigned wide = (unsigned)c->n_to_host > c->host_channels ? (unsigned)c->n_to_host : c->host_channels;
+  c->hs_bint = c->hs_bint_cfg;
+  while (c->hs_bint > 1 && mpcua_usb_packet_bytes(wide, c->sample_bytes, c->rate, c->hs_bint) > 1024) c->hs_bint--;
   return rc;
 }
 
